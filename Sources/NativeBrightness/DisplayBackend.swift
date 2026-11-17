@@ -6,6 +6,13 @@ protocol DisplayBackend: AnyObject {
     func displays() -> [DisplayInfo]
     func setBrightness(_ value: Double, for displayID: UInt32) throws
     func restore(_ displayID: UInt32) throws
+    func needsBrightnessSync(_ value: Double, for displayID: UInt32) -> Bool
+}
+
+extension DisplayBackend {
+    func needsBrightnessSync(_ value: Double, for displayID: UInt32) -> Bool {
+        false
+    }
 }
 
 enum DisplayBackendError: LocalizedError {
@@ -50,6 +57,7 @@ final class GammaDisplayBackend: DisplayBackend {
             let method: BrightnessControlMethod = formula(for: id) == nil ? .unavailable : .gamma
             return DisplayInfo(
                 id: id,
+                persistentID: persistentDisplayID(for: id),
                 name: name,
                 isBuiltIn: CGDisplayIsBuiltin(id) != 0,
                 method: method,
@@ -82,7 +90,7 @@ final class GammaDisplayBackend: DisplayBackend {
         guard activeDisplayIDs().contains(displayID) else {
             throw DisplayBackendError.unsupportedDisplay(displayID)
         }
-        guard let formula = originalFormulas[displayID] else {
+        guard let formula = formula(for: displayID) else {
             throw DisplayBackendError.unsupportedDisplay(displayID)
         }
         let error = CGSetDisplayTransferByFormula(
@@ -96,11 +104,83 @@ final class GammaDisplayBackend: DisplayBackend {
         }
     }
 
+    func needsBrightnessSync(_ value: Double, for displayID: UInt32) -> Bool {
+        guard activeDisplayIDs().contains(displayID),
+              let base = formula(for: displayID),
+              let live = readFormula(for: displayID) else {
+            return false
+        }
+        let level = CGGammaValue(BrightnessMath.clamped(value))
+        let expectedRedMax = max(base.redMin + 0.0001, base.redMax * level)
+        let expectedGreenMax = max(base.greenMin + 0.0001, base.greenMax * level)
+        let expectedBlueMax = max(base.blueMin + 0.0001, base.blueMax * level)
+        return abs(live.redMax - expectedRedMax) > 0.015
+            || abs(live.greenMax - expectedGreenMax) > 0.015
+            || abs(live.blueMax - expectedBlueMax) > 0.015
+    }
+
     private func formula(for id: UInt32) -> TransferFormula? {
         if let existing = originalFormulas[id] { return existing }
-        guard let formula = readFormula(for: id) else { return nil }
-        originalFormulas[id] = formula
-        return formula
+        guard let rawFormula = readFormula(for: id) else { return nil }
+        let normalized = Self.normalizedBaseline(rawFormula)
+        originalFormulas[id] = normalized
+        return normalized
+    }
+
+    private static func normalizedBaseline(_ raw: TransferFormula) -> TransferFormula {
+        func clampMin(_ value: CGGammaValue) -> CGGammaValue {
+            guard value.isFinite else { return 0.0 }
+            return min(max(value, 0.0), 0.5)
+        }
+
+        func sanitizeGamma(_ value: CGGammaValue) -> CGGammaValue {
+            guard value.isFinite, value > 0.05 else { return 1.0 }
+            return value
+        }
+
+        let rRaw = raw.redMax.isFinite ? max(raw.redMax, 0) : 0
+        let gRaw = raw.greenMax.isFinite ? max(raw.greenMax, 0) : 0
+        let bRaw = raw.blueMax.isFinite ? max(raw.blueMax, 0) : 0
+        let peak = max(rRaw, max(gRaw, bRaw))
+
+        let rMax: CGGammaValue
+        let gMax: CGGammaValue
+        let bMax: CGGammaValue
+        if !peak.isFinite || peak <= 0.05 {
+            rMax = 1.0
+            gMax = 1.0
+            bMax = 1.0
+        } else if peak < 1.0 {
+            rMax = rRaw / peak
+            gMax = gRaw / peak
+            bMax = bRaw / peak
+        } else {
+            rMax = rRaw
+            gMax = gRaw
+            bMax = bRaw
+        }
+
+        return TransferFormula(
+            redMin: clampMin(raw.redMin),
+            redMax: rMax,
+            redGamma: sanitizeGamma(raw.redGamma),
+            greenMin: clampMin(raw.greenMin),
+            greenMax: gMax,
+            greenGamma: sanitizeGamma(raw.greenGamma),
+            blueMin: clampMin(raw.blueMin),
+            blueMax: bMax,
+            blueGamma: sanitizeGamma(raw.blueGamma)
+        )
+    }
+
+    private func persistentDisplayID(for id: UInt32) -> String {
+        if let uuid = CGDisplayCreateUUIDFromDisplayID(id)?.takeRetainedValue(),
+           let uuidString = CFUUIDCreateString(nil, uuid) as String?,
+           !uuidString.isEmpty {
+            return "uuid:\(uuidString)"
+        }
+        let builtInFlag = CGDisplayIsBuiltin(id) != 0 ? 1 : 0
+        return "hw:\(builtInFlag)-\(CGDisplayVendorNumber(id))-\(CGDisplayModelNumber(id))-\(CGDisplaySerialNumber(id))-\(CGDisplayUnitNumber(id))"
     }
 
     private func readFormula(for id: UInt32) -> TransferFormula? {

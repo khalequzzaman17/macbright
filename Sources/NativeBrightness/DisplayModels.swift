@@ -8,11 +8,30 @@ enum BrightnessControlMethod: String, Codable, Sendable {
 
 struct DisplayInfo: Identifiable, Equatable, Sendable {
     let id: UInt32
+    let persistentID: String?
     let name: String
     let isBuiltIn: Bool
     let method: BrightnessControlMethod
     var brightness: Double
     var isOnline: Bool = true
+
+    init(
+        id: UInt32,
+        persistentID: String? = nil,
+        name: String,
+        isBuiltIn: Bool,
+        method: BrightnessControlMethod,
+        brightness: Double,
+        isOnline: Bool = true
+    ) {
+        self.id = id
+        self.persistentID = persistentID
+        self.name = name
+        self.isBuiltIn = isBuiltIn
+        self.method = method
+        self.brightness = brightness
+        self.isOnline = isOnline
+    }
 
     var supportDescription: String {
         switch method {
